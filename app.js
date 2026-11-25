@@ -31,6 +31,7 @@
     changed_color: '#1e88e5',
     type_prefs: {},
     type_order: [],
+    notify_mode: 'badge',
   };
   const PALETTE = [
     '#f4c430', '#ffb300', '#ef6c00', '#e53935', '#d81b60', '#8e24aa',
@@ -138,6 +139,7 @@
         changed_color: s.changed_color,
         type_prefs: s.type_prefs,
         type_order: s.type_order,
+        notify_mode: s.notify_mode,
         updated_at: new Date().toISOString(),
       });
       toast(error ? errMsg(error) : 'Preferenze salvate');
@@ -332,7 +334,7 @@
       sb.from('swap_requests').select('id', { count: 'exact', head: true }).eq('target_id', me).eq('status', 'pending'),
       sb.from('swap_requests').select('id', { count: 'exact', head: true }).eq('requester_id', me).eq('requester_seen', false),
     ]);
-    const n = (a.count || 0) + (b.count || 0);
+    const n = state.settings?.notify_mode === 'none' ? 0 : (a.count || 0) + (b.count || 0);
     const el = document.getElementById('reqBadge');
     if (el) { el.hidden = !n; el.textContent = n; }
   }
@@ -747,6 +749,18 @@
           <div style="margin-top:8px"><span class="pill">${roles[p.role] || p.role}</span></div>
         </div>
 
+        <h3>Notifiche</h3>
+        <div class="card">
+          <label class="switch-row"><span>Badge ed email</span><input type="radio" name="nm" value="email" ${s.notify_mode === 'email' ? 'checked' : ''}></label>
+          <div class="muted small">Il numerino rosso nell'app e un'email a ${esc(p.email)} per richieste di cambio, risposte e nuovi turni caricati.</div>
+          <hr class="sep">
+          <label class="switch-row"><span>Solo badge</span><input type="radio" name="nm" value="badge" ${s.notify_mode === 'badge' ? 'checked' : ''}></label>
+          <div class="muted small">Solo il numerino rosso sulla scheda Richieste.</div>
+          <hr class="sep">
+          <label class="switch-row"><span>Nessuna</span><input type="radio" name="nm" value="none" ${s.notify_mode === 'none' ? 'checked' : ''}></label>
+          <div class="muted small">Nessun avviso: controlli tu la scheda Richieste.</div>
+        </div>
+
         <h3>Dimensione del testo nel calendario</h3>
         <div class="tabs" id="fontSizes">
           ${FONT_SIZES.map(f => `<button data-fs="${f.v}" class="${Number(s.font_scale) === f.v ? 'active' : ''}">${f.label}</button>`).join('')}
@@ -770,6 +784,11 @@
         <button class="btn block danger" id="logout" style="margin-top:24px">Esci</button>
       </div>`;
     document.getElementById('logout').onclick = () => sb.auth.signOut();
+
+    view.querySelectorAll('input[name=nm]').forEach(r => r.onchange = () => {
+      saveSettings({ notify_mode: r.value });
+      refreshRequestsBadge();
+    });
 
     view.querySelectorAll('[data-fs]').forEach(b => b.onclick = () => {
       saveSettings({ font_scale: Number(b.dataset.fs) });
@@ -882,16 +901,20 @@
     if (v === 'users') return adminUsers(view);
     if (v === 'types') return adminTypes(view);
     if (v === 'import') return adminImport(view);
+    if (v === 'backup') return adminBackup(view);
     adminFrame(view, 'Admin', `
       <div class="menu">
         <button data-go="pending"><span>Iscrizioni da approvare<span class="sub">Nuove richieste di accesso</span></span><span id="pendingPill">›</span></button>
         <button data-go="users"><span>Utenti e nomi visibili<span class="sub">Nome mostrato ai colleghi e ruoli</span></span>›</button>
         <button data-go="types"><span>Tipi di turno<span class="sub">Ordine, abbreviazione, colore, categoria</span></span>›</button>
         <button data-go="import"><span>Carica turni (CSV)<span class="sub">Sostituisce le date presenti nel file</span></span>›</button>
-        <button id="exportBtn"><span>Scarica turni (CSV)<span class="sub">Con tutti i cambi già applicati</span></span>⬇</button>
+        <button id="exportXlsx"><span>Scarica turni (Excel)<span class="sub">File .xlsx con tutti i cambi già applicati</span></span>⬇</button>
+        <button id="exportBtn"><span>Scarica turni (CSV)<span class="sub">Stesso formato del file da caricare</span></span>⬇</button>
+        <button data-go="backup"><span>Backup ed email<span class="sub">Backup giornaliero in Excel e mittente delle email</span></span>›</button>
       </div>`);
     view.querySelectorAll('[data-go]').forEach(b => b.onclick = () => { state.adminView = b.dataset.go; renderTab(); });
     document.getElementById('exportBtn').onclick = exportCsv;
+    document.getElementById('exportXlsx').onclick = exportXlsx;
     const showPill = () => {
       const pill = document.getElementById('pendingPill');
       if (!pill) return;
@@ -1166,8 +1189,112 @@
     };
   }
 
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src; s.onload = resolve; s.onerror = () => reject(new Error('Impossibile caricare il generatore Excel'));
+      document.head.appendChild(s);
+    });
+  }
+
+  // Il server restituisce al massimo 1000 righe per volta: le leggiamo a pagine
+  async function fetchAllShifts() {
+    const all = [];
+    for (let from = 0; ; from += 1000) {
+      const { data, error } = await sb.rpc('export_shifts', {}).range(from, from + 999);
+      if (error) return { data: null, error };
+      all.push(...data);
+      if (data.length < 1000) return { data: all, error: null };
+    }
+  }
+
+  async function adminBackup(view) {
+    adminFrame(view, 'Backup ed email', '<div id="bkBox"><p class="muted">Caricamento…</p></div>');
+    const { data: s, error } = await sb.from('app_settings').select('*').eq('id', 1).single();
+    const box = document.getElementById('bkBox');
+    if (error) { box.innerHTML = `<p class="err">${esc(errMsg(error))}</p>`; return; }
+    box.innerHTML = `
+      <h3>Mittente delle email</h3>
+      <div class="card">
+        <p class="muted small" style="margin-top:0">L'indirizzo da cui partono notifiche e backup. Deve essere lo stesso verificato su Brevo.</p>
+        <label>Email del mittente</label>
+        <input type="email" id="se" value="${esc(s.sender_email || '')}" placeholder="es. turni.mnfe@gmail.com">
+        <label>Nome del mittente</label>
+        <input type="text" id="sn" value="${esc(s.sender_name || '')}">
+      </div>
+
+      <h3>Backup giornaliero</h3>
+      <div class="card">
+        <label class="switch-row"><span>Invia ogni giorno il file Excel dei turni</span>
+          <input type="checkbox" id="be" ${s.backup_enabled ? 'checked' : ''}></label>
+        <label>Indirizzo che riceve il backup</label>
+        <input type="email" id="bm" value="${esc(s.backup_email || '')}" placeholder="es. nome.cognome@cultura.gov.it">
+        <p class="muted small">Ogni mattina verso le 6 (le 7 con l'ora legale). Ultimo backup: ${s.last_backup_at ? new Date(s.last_backup_at).toLocaleString('it-IT') : 'mai'}.</p>
+      </div>
+      <button class="btn primary block" id="saveBk">Salva</button>
+      <button class="btn block" id="testMail">Invia un'email di prova a me</button>
+      <button class="btn block" id="runBk">Invia un backup adesso</button>
+      <div id="bkMsg"></div>`;
+
+    const msg = (t, ok) => { document.getElementById('bkMsg').innerHTML = `<div class="report ${ok ? 'ok' : 'err'}">${esc(t)}</div>`; };
+    const save = async () => {
+      const upd = {
+        sender_email: document.getElementById('se').value.trim() || null,
+        sender_name: document.getElementById('sn').value.trim() || 'Turni MNFE',
+        backup_enabled: document.getElementById('be').checked,
+        backup_email: document.getElementById('bm').value.trim() || null,
+        updated_at: new Date().toISOString(),
+      };
+      if (upd.backup_enabled && !upd.backup_email) throw new Error('Inserisci l\'indirizzo che riceve il backup');
+      const { error } = await sb.from('app_settings').update(upd).eq('id', 1);
+      if (error) throw error;
+    };
+    const invoke = async (fn, body) => {
+      const { data, error } = await sb.functions.invoke(fn, { body });
+      if (error) {
+        let detail = error.message;
+        try { detail = (await error.context.json()).error || detail; } catch (_) { /* nessun dettaglio */ }
+        throw new Error(detail);
+      }
+      return data;
+    };
+    document.getElementById('saveBk').onclick = async e => {
+      e.target.disabled = true;
+      try { await save(); toast('Salvato'); } catch (err) { toast(errMsg(err)); }
+      e.target.disabled = false;
+    };
+    document.getElementById('testMail').onclick = async e => {
+      e.target.disabled = true;
+      try { await save(); const r = await invoke('notify', { test: true }); msg(`Email di prova inviata a ${r.to}. Controlla la posta (anche lo spam).`, true); }
+      catch (err) { msg('Invio non riuscito: ' + errMsg(err), false); }
+      e.target.disabled = false;
+    };
+    document.getElementById('runBk').onclick = async e => {
+      e.target.disabled = true;
+      try { await save(); const r = await invoke('daily-backup', { force: true }); msg(`Backup inviato a ${r.to} (${r.rows} righe).`, true); }
+      catch (err) { msg('Backup non riuscito: ' + errMsg(err), false); }
+      e.target.disabled = false;
+    };
+  }
+
+  async function exportXlsx() {
+    try {
+      if (!window.XLSX) await loadScript('https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js');
+      const { data, error } = await fetchAllShifts();
+      if (error) throw error;
+      if (!data.length) return toast('Non ci sono turni da scaricare');
+      const rows = [['DATA', 'DIPENDENTE', 'TURNO'], ...data.map(r => [fromIso(r.date), r.email, r.shift])];
+      const ws = XLSX.utils.aoa_to_sheet(rows, { cellDates: true, dateNF: 'dd/mm/yyyy' });
+      ws['!cols'] = [{ wch: 12 }, { wch: 36 }, { wch: 24 }];
+      ws['!autofilter'] = { ref: `A1:C${rows.length}` };
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Turni');
+      XLSX.writeFile(wb, `turni_${iso(new Date())}.xlsx`);
+    } catch (e) { toast(errMsg(e)); }
+  }
+
   async function exportCsv() {
-    const { data, error } = await sb.rpc('export_shifts', {});
+    const { data, error } = await fetchAllShifts();
     if (error) return toast(errMsg(error));
     if (!data.length) return toast('Non ci sono turni da scaricare');
     const q = v => /[;"\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;

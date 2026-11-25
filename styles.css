@@ -230,6 +230,10 @@ textarea {
 .pill.st-no { background: #fee4e2; color: #b42318; }
 .pill.st-new { background: var(--primary); color: #fff; }
 
+hr.sep { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
+.report.ok { color: var(--ok); }
+.report.err { color: var(--danger); }
+
 .toast {
   position: fixed; left: 50%; bottom: calc(96px + var(--safe-bottom)); transform: translateX(-50%); z-index: 50;
   background: #1b1f24; color: #fff; padding: 10px 16px; border-radius: 10px; font-size: .9rem;

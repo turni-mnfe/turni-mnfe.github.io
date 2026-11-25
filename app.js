@@ -285,7 +285,7 @@
         </div>
       </div>`;
     if (canRefresh) document.getElementById('refresh').onclick = route;
-    document.getElementById('logout').onclick = () => sb.auth.signOut();
+    document.getElementById('logout').onclick = () => sb.auth.signOut({ scope: 'local' });
   }
 
   // ------------------------------------------------------------------
@@ -783,7 +783,7 @@
 
         <button class="btn block danger" id="logout" style="margin-top:24px">Esci</button>
       </div>`;
-    document.getElementById('logout').onclick = () => sb.auth.signOut();
+    document.getElementById('logout').onclick = () => sb.auth.signOut({ scope: 'local' });
 
     view.querySelectorAll('input[name=nm]').forEach(r => r.onchange = () => {
       saveSettings({ notify_mode: r.value });

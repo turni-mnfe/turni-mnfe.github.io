@@ -110,6 +110,7 @@ input:focus, select:focus { outline: 2px solid var(--primary); outline-offset: -
   background: var(--danger); color: #fff; font-size: .7rem; font-weight: 700;
   display: grid; place-items: center;
 }
+[hidden] { display: none !important; }
 
 /* ---------- Calendario ---------- */
 .weekdays, .grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }

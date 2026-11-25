@@ -22,7 +22,27 @@
     month: firstOfMonth(new Date()),
     authMode: 'login',
     pendingCount: 0,
+    settings: null,
   };
+
+  const DEFAULT_SETTINGS = {
+    font_scale: 1,
+    highlight_changed: true,
+    changed_color: '#1e88e5',
+    type_prefs: {},
+    type_order: [],
+  };
+  const PALETTE = [
+    '#f4c430', '#ffb300', '#ef6c00', '#e53935', '#d81b60', '#8e24aa',
+    '#5e35b1', '#3949ab', '#1e88e5', '#039be5', '#00897b', '#43a047',
+    '#7cb342', '#c0ca33', '#6d4c41', '#757575', '#90a4ae', '#212121',
+  ];
+  const FONT_SIZES = [
+    { v: 0.85, label: 'Piccolo' },
+    { v: 1, label: 'Normale' },
+    { v: 1.25, label: 'Grande' },
+    { v: 1.5, label: 'Molto grande' },
+  ];
 
   // ------------------------------------------------------------------
   // Utilità
@@ -92,6 +112,57 @@
   const isAdmin = () => state.profile?.role === 'admin';
 
   // ------------------------------------------------------------------
+  // Impostazioni personali
+  // ------------------------------------------------------------------
+  async function loadSettings() {
+    const { data } = await sb.from('user_settings').select('*').eq('user_id', state.session.user.id).maybeSingle();
+    state.settings = { ...DEFAULT_SETTINGS, ...(data || {}) };
+    applyFontScale();
+  }
+
+  function applyFontScale() {
+    document.documentElement.style.setProperty('--font-scale', state.settings?.font_scale || 1);
+  }
+
+  let saveTimer;
+  function saveSettings(patch) {
+    Object.assign(state.settings, patch);
+    applyFontScale();
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(async () => {
+      const s = state.settings;
+      const { error } = await sb.from('user_settings').upsert({
+        user_id: state.session.user.id,
+        font_scale: s.font_scale,
+        highlight_changed: s.highlight_changed,
+        changed_color: s.changed_color,
+        type_prefs: s.type_prefs,
+        type_order: s.type_order,
+        updated_at: new Date().toISOString(),
+      });
+      toast(error ? errMsg(error) : 'Preferenze salvate');
+    }, 700);
+  }
+
+  // Colore ed etichetta che QUESTO utente vede per un turno
+  function look(type, changed) {
+    const p = state.settings?.type_prefs?.[type.id] || {};
+    let color = p.color || type.color;
+    if (changed && state.settings?.highlight_changed) color = state.settings.changed_color;
+    return { color, label: p.label || type.short_label };
+  }
+
+  // Ordine personale dei turni (poi l'ordine predefinito dell'admin)
+  function sortTypes(list, get = x => x) {
+    const order = (state.settings?.type_order || []).map(Number);
+    const pos = id => { const i = order.indexOf(Number(id)); return i < 0 ? Infinity : i; };
+    return list.sort((a, b) => {
+      const ta = get(a), tb = get(b);
+      return (pos(ta.id) - pos(tb.id)) || (ta.sort_order - tb.sort_order) || ta.name.localeCompare(tb.name, 'it');
+    });
+  }
+
+  // ------------------------------------------------------------------
   // Avvio e sessione
   // ------------------------------------------------------------------
   async function loadProfile() {
@@ -112,6 +183,7 @@
     if (state.profile.status === 'rejected') {
       return renderStatus('Iscrizione non approvata', 'La tua richiesta di iscrizione non è stata approvata. Per informazioni contatta l\'amministratore.');
     }
+    await loadSettings();
     renderShell();
   }
 
@@ -287,9 +359,10 @@
         if (d.getMonth() !== m.getMonth()) cls.push('out');
         if (d.getDay() === 0) cls.push('sun');
         if (key === todayIso) cls.push('today');
+        const lk = t ? look(t, s.changed) : null;
         cells.push(`<button class="${cls.join(' ')}" data-day="${key}">
           <span><span class="num">${d.getDate()}</span></span>
-          ${t ? `<span class="chip" style="background:${esc(t.color)};color:${textOn(t.color)}">${esc(t.short_label)}</span>` : ''}
+          ${lk ? `<span class="chip" style="background:${esc(lk.color)};color:${textOn(lk.color)}">${esc(lk.label)}</span>` : ''}
         </button>`);
       }
       const grid = document.getElementById('grid');
@@ -328,7 +401,7 @@
     const t = mine?.shift_types;
     const backdrop = document.createElement('div');
     backdrop.className = 'sheet-backdrop';
-    const accent = t?.color;
+    const accent = t ? look(t, mine.changed).color : null;
     const styleVars = accent
       ? `--day-accent:${accent};--day-accent-text:${textOn(accent)};--day-bg:color-mix(in srgb, ${accent} 14%, var(--surface));`
       : '';
@@ -361,12 +434,11 @@
       if (!groups.has(st.id)) groups.set(st.id, { type: st, people: [] });
       groups.get(st.id).people.push({ name: r.people?.display_name || r.email, me: r.email === state.profile.email });
     });
-    const sorted = [...groups.values()].sort((a, b) =>
-      (a.type.sort_order - b.type.sort_order) || a.type.name.localeCompare(b.type.name, 'it'));
+    const sorted = sortTypes([...groups.values()], g => g.type);
 
     const renderGroups = list => list.map(g => `
       <div class="group">
-        <div class="gname"><span class="dot" style="background:${esc(g.type.color)}"></span>${esc(g.type.name)}</div>
+        <div class="gname"><span class="dot" style="background:${esc(look(g.type).color)}"></span>${esc(g.type.name)}</div>
         <div class="names">${g.people.sort((a, b) => a.name.localeCompare(b.name, 'it'))
           .map(p => p.me ? `<b>${esc(p.name)} (tu)</b>` : esc(p.name)).join(', ')}</div>
       </div>`).join('');
@@ -381,8 +453,24 @@
   // ------------------------------------------------------------------
   // Profilo
   // ------------------------------------------------------------------
-  function renderProfile(view) {
+  function paletteHtml(current, withDefault) {
+    const cur = (current || '').toLowerCase();
+    return `<div class="palette">
+      ${PALETTE.map(c => `<button type="button" class="sw ${c === cur ? 'sel' : ''}" data-color="${c}" style="background:${c}" aria-label="Colore ${c}"></button>`).join('')}
+      <label class="sw custom" title="Altro colore"><input type="color" value="${esc(current || '#1e88e5')}">＋</label>
+      ${withDefault ? '<button type="button" class="btn small-btn" data-color="">Predefinito</button>' : ''}
+    </div>`;
+  }
+
+  function bindPalette(root, onPick) {
+    root.querySelectorAll('[data-color]').forEach(b => b.onclick = () => onPick(b.dataset.color || null));
+    const inp = root.querySelector('input[type=color]');
+    if (inp) inp.onchange = () => onPick(inp.value);
+  }
+
+  async function renderProfile(view) {
     const p = state.profile;
+    const s = state.settings;
     const roles = { admin: 'Admin completo', admin_shifts: 'Admin cambi turno', user: 'Utente' };
     view.innerHTML = `
       <div class="topbar"><div class="title">Profilo</div></div>
@@ -392,10 +480,120 @@
           <div class="muted">${esc(p.email)}</div>
           <div style="margin-top:8px"><span class="pill">${roles[p.role] || p.role}</span></div>
         </div>
-        <p class="muted small">Colori, etichette e dimensione del testo arriveranno con il prossimo aggiornamento.</p>
-        <button class="btn block danger" id="logout">Esci</button>
+
+        <h3>Dimensione del testo nel calendario</h3>
+        <div class="tabs" id="fontSizes">
+          ${FONT_SIZES.map(f => `<button data-fs="${f.v}" class="${Number(s.font_scale) === f.v ? 'active' : ''}">${f.label}</button>`).join('')}
+        </div>
+
+        <h3>Turni cambiati</h3>
+        <div class="card">
+          <label class="switch-row"><span>Evidenzia con un colore diverso i turni arrivati da un cambio</span>
+            <input type="checkbox" id="hl" ${s.highlight_changed ? 'checked' : ''}></label>
+          <div id="hlColor" ${s.highlight_changed ? '' : 'hidden'}>
+            <div class="muted small" style="margin:10px 0 6px">Colore dei turni cambiati</div>
+            ${paletteHtml(s.changed_color, false)}
+          </div>
+        </div>
+
+        <h3>I miei turni</h3>
+        <p class="muted small">Scegli come vedere ogni turno: abbreviazione e colore valgono solo per te. Con le frecce decidi l'ordine nella vista del giorno.</p>
+        <div class="list" id="types"><p class="muted">Caricamento…</p></div>
+        <button class="btn block" id="resetTypes">Ripristina colori, nomi e ordine predefiniti</button>
+
+        <button class="btn block danger" id="logout" style="margin-top:24px">Esci</button>
       </div>`;
     document.getElementById('logout').onclick = () => sb.auth.signOut();
+
+    view.querySelectorAll('[data-fs]').forEach(b => b.onclick = () => {
+      saveSettings({ font_scale: Number(b.dataset.fs) });
+      view.querySelectorAll('[data-fs]').forEach(x => x.classList.toggle('active', x === b));
+    });
+
+    const hl = document.getElementById('hl');
+    hl.onchange = () => {
+      saveSettings({ highlight_changed: hl.checked });
+      document.getElementById('hlColor').hidden = !hl.checked;
+    };
+    const hlBox = document.getElementById('hlColor');
+    bindPalette(hlBox, c => {
+      if (!c) return;
+      saveSettings({ changed_color: c });
+      hlBox.querySelectorAll('.sw').forEach(x => x.classList.toggle('sel', x.dataset.color === c));
+    });
+
+    const { data: types, error } = await sb.from('shift_types').select('id, name, short_label, color, sort_order, category');
+    const box = document.getElementById('types');
+    if (!box) return;
+    if (error) { box.innerHTML = `<p class="err">${esc(errMsg(error))}</p>`; return; }
+    if (!types.length) { box.innerHTML = '<p class="muted">Non ci sono ancora turni caricati.</p>'; return; }
+
+    const setPref = (id, patch) => {
+      const prefs = { ...s.type_prefs };
+      const cur = { ...(prefs[id] || {}), ...patch };
+      Object.keys(cur).forEach(k => { if (cur[k] == null || cur[k] === '') delete cur[k]; });
+      if (Object.keys(cur).length) prefs[id] = cur; else delete prefs[id];
+      saveSettings({ type_prefs: prefs });
+    };
+
+    const draw = () => {
+      const list = sortTypes([...types]);
+      box.innerHTML = list.map((t, i) => {
+        const lk = look(t);
+        const pref = s.type_prefs[t.id] || {};
+        return `<div class="row trow" data-id="${t.id}">
+          <div class="trow-head">
+            <div class="order">
+              <button class="iconbtn sm" data-move="-1" ${i === 0 ? 'disabled' : ''} aria-label="Sposta su">▲</button>
+              <button class="iconbtn sm" data-move="1" ${i === list.length - 1 ? 'disabled' : ''} aria-label="Sposta giù">▼</button>
+            </div>
+            <span class="chip big" style="background:${esc(lk.color)};color:${textOn(lk.color)}">${esc(lk.label)}</span>
+            <div class="tname"><b>${esc(t.name)}</b><div class="muted small">${t.category === 'assenza' ? 'Assenza / riposo' : 'In servizio'}</div></div>
+            <button class="iconbtn sm" data-open aria-label="Modifica">✎</button>
+          </div>
+          <div class="trow-edit" hidden>
+            <label>Come lo vuoi vedere nel calendario</label>
+            <input type="text" class="lbl" maxlength="12" value="${esc(pref.label || '')}" placeholder="${esc(t.short_label)}">
+            <div class="muted small" style="margin:10px 0 6px">Colore</div>
+            ${paletteHtml(lk.color, true)}
+          </div>
+        </div>`;
+      }).join('');
+
+      box.querySelectorAll('.trow').forEach(row => {
+        const id = row.dataset.id;
+        const t = types.find(x => String(x.id) === id);
+        const refreshChip = () => {
+          const lk = look(t);
+          const chip = row.querySelector('.chip');
+          chip.textContent = lk.label;
+          chip.style.background = lk.color;
+          chip.style.color = textOn(lk.color);
+          row.querySelectorAll('.sw').forEach(x => x.classList.toggle('sel', x.dataset.color === lk.color.toLowerCase()));
+        };
+        row.querySelector('[data-open]').onclick = () => {
+          const ed = row.querySelector('.trow-edit');
+          ed.hidden = !ed.hidden;
+        };
+        row.querySelector('.lbl').oninput = e => { setPref(id, { label: e.target.value.trim() }); refreshChip(); };
+        bindPalette(row.querySelector('.trow-edit'), c => { setPref(id, { color: c }); refreshChip(); });
+        row.querySelectorAll('[data-move]').forEach(b => b.onclick = () => {
+          const ids = sortTypes([...types]).map(x => x.id);
+          const i = ids.indexOf(t.id), j = i + Number(b.dataset.move);
+          if (j < 0 || j >= ids.length) return;
+          [ids[i], ids[j]] = [ids[j], ids[i]];
+          saveSettings({ type_order: ids });
+          draw();
+        });
+      });
+    };
+    draw();
+
+    document.getElementById('resetTypes').onclick = () => {
+      if (!confirm('Ripristinare colori, nomi e ordine predefiniti dei turni?')) return;
+      saveSettings({ type_prefs: {}, type_order: [] });
+      draw();
+    };
   }
 
   // ------------------------------------------------------------------

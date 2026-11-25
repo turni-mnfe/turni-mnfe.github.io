@@ -5,6 +5,14 @@
 create extension if not exists pg_net with schema extensions;
 create extension if not exists pg_cron;
 
+-- Le funzioni server (Edge Functions) usano il ruolo service_role: serve l'accesso alle tabelle
+-- (il progetto è stato creato senza permessi automatici sulle nuove tabelle)
+grant usage on schema public to service_role;
+grant all on all tables in schema public to service_role;
+grant all on all sequences in schema public to service_role;
+alter default privileges in schema public grant all on tables to service_role;
+alter default privileges in schema public grant all on sequences to service_role;
+
 -- Preferenza notifiche di ogni utente: 'email' (badge + email), 'badge', 'none'
 alter table public.user_settings
   add column notify_mode text not null default 'badge'

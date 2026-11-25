@@ -215,6 +215,21 @@ input:focus, select:focus { outline: 2px solid var(--primary); outline-offset: -
   font-weight: 800; font-size: .85rem;
 }
 
+/* ---------- Cambi turno ---------- */
+.day-actions { margin-top: 8px; }
+.day-actions .btn.block { margin-top: 10px; }
+.pick { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.pick .btn { padding: 10px 14px; }
+.swapmark { color: var(--primary); font-weight: 700; }
+textarea {
+  width: 100%; padding: 12px; font: inherit; font-size: 16px; resize: vertical;
+  color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+}
+.quote { margin-top: 8px; padding: 8px 10px; border-left: 3px solid var(--line); background: var(--surface-2); border-radius: 6px; font-size: .92rem; }
+.pill.st-ok { background: #d1fadf; color: #05603a; }
+.pill.st-no { background: #fee4e2; color: #b42318; }
+.pill.st-new { background: var(--primary); color: #fff; }
+
 .toast {
   position: fixed; left: 50%; bottom: calc(96px + var(--safe-bottom)); transform: translateX(-50%); z-index: 50;
   background: #1b1f24; color: #fff; padding: 10px 16px; border-radius: 10px; font-size: .9rem;

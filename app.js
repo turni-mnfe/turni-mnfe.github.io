@@ -294,6 +294,7 @@
       <div id="view" style="display:flex;flex-direction:column;flex:1"></div>
       <nav class="bottomnav"><div class="inner">
         <button data-tab="calendar"><span class="ico">📅</span>Calendario</button>
+        <button data-tab="requests"><span class="ico">🔁</span>Richieste<span class="badge" id="reqBadge" hidden></span></button>
         ${isAdmin() ? '<button data-tab="admin"><span class="ico">🛠️</span>Admin<span class="badge" id="pendingBadge" hidden></span></button>' : ''}
         <button data-tab="profile"><span class="ico">👤</span>Profilo</button>
       </div></nav>`;
@@ -304,6 +305,7 @@
     });
     renderTab();
     refreshPendingBadge();
+    refreshRequestsBadge();
   }
 
   function renderTab() {
@@ -311,6 +313,7 @@
     const view = document.getElementById('view');
     if (state.tab === 'admin' && isAdmin()) return renderAdmin(view);
     if (state.tab === 'profile') return renderProfile(view);
+    if (state.tab === 'requests') return renderRequests(view);
     return renderCalendar(view);
   }
 
@@ -321,6 +324,28 @@
     const b = document.getElementById('pendingBadge');
     if (b) { b.hidden = !state.pendingCount; b.textContent = state.pendingCount; }
   }
+
+  async function refreshRequestsBadge() {
+    if (!state.profile || state.profile.status !== 'approved') return;
+    const me = state.session.user.id;
+    const [a, b] = await Promise.all([
+      sb.from('swap_requests').select('id', { count: 'exact', head: true }).eq('target_id', me).eq('status', 'pending'),
+      sb.from('swap_requests').select('id', { count: 'exact', head: true }).eq('requester_id', me).eq('requester_seen', false),
+    ]);
+    const n = (a.count || 0) + (b.count || 0);
+    const el = document.getElementById('reqBadge');
+    if (el) { el.hidden = !n; el.textContent = n; }
+  }
+
+  // aggiorna i badge quando si torna sull'app e ogni minuto
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && state.profile?.status === 'approved') { refreshRequestsBadge(); refreshPendingBadge(); }
+  });
+  setInterval(() => {
+    if (!document.hidden && state.profile?.status === 'approved') { refreshRequestsBadge(); refreshPendingBadge(); }
+  }, 60000);
+
+  const isShiftAdmin = () => ['admin', 'admin_shifts'].includes(state.profile?.role);
 
   // ------------------------------------------------------------------
   // Calendario
@@ -417,37 +442,278 @@
         <div class="sheet-body" id="dayBody"><p class="muted">Caricamento…</p></div>
       </div>`;
     document.body.appendChild(backdrop);
-    const close = () => backdrop.remove();
+    let dirty = false;
+    const close = () => {
+      backdrop.remove();
+      if (dirty && state.tab === 'calendar') renderTab();
+    };
     backdrop.onclick = e => { if (e.target === backdrop) close(); };
     backdrop.querySelector('#closeDay').onclick = close;
-
-    const { data, error } = await sb.from('shifts')
-      .select(`email, changed, ${SHIFT_TYPE_FK}(id, name, sort_order, category, color), people(display_name)`)
-      .eq('date', dayIso);
     const body = backdrop.querySelector('#dayBody');
-    if (error) { body.innerHTML = `<p class="err">${esc(errMsg(error))}</p>`; return; }
-    if (!data || !data.length) { body.innerHTML = '<p class="muted">Nessun turno caricato per questo giorno.</p>'; return; }
 
-    const groups = new Map();
-    data.forEach(r => {
-      const st = r.shift_types;
-      if (!groups.has(st.id)) groups.set(st.id, { type: st, people: [] });
-      groups.get(st.id).people.push({ name: r.people?.display_name || r.email, me: r.email === state.profile.email });
+    const [res, reg] = await Promise.all([
+      sb.from('shifts')
+        .select(`email, changed, ${SHIFT_TYPE_FK}(id, name, sort_order, category, color), people(display_name)`)
+        .eq('date', dayIso),
+      sb.rpc('registered_emails'),
+    ]);
+    if (res.error) { body.innerHTML = `<p class="err">${esc(errMsg(res.error))}</p>`; return; }
+    const data = res.data || [];
+    const registered = new Set(reg.data || []);
+    if (!data.length) { body.innerHTML = '<p class="muted">Nessun turno caricato per questo giorno.</p>'; return; }
+
+    const people = data.map(r => ({
+      email: r.email,
+      name: r.people?.display_name || r.email,
+      type: r.shift_types,
+      changed: r.changed,
+      me: r.email === state.profile.email,
+      registered: registered.has(r.email),
+    }));
+    const myRow = people.find(p => p.me);
+    const canRequest = myRow && dayIso >= iso(new Date());
+
+    const groupsOf = list => {
+      const g = new Map();
+      list.forEach(p => {
+        if (!g.has(p.type.id)) g.set(p.type.id, { type: p.type, people: [] });
+        g.get(p.type.id).people.push(p);
+      });
+      return sortTypes([...g.values()], x => x.type)
+        .map(x => ({ ...x, people: x.people.sort((a, b) => a.name.localeCompare(b.name, 'it')) }));
+    };
+    const groupHead = t => `<div class="gname"><span class="dot" style="background:${esc(look(t).color)}"></span>${esc(t.name)}</div>`;
+
+    // ---- elenco di chi fa cosa ----
+    const showMain = () => {
+      const sorted = groupsOf(people);
+      const renderGroups = list => list.map(g => `
+        <div class="group">
+          ${groupHead(g.type)}
+          <div class="names">${g.people.map(p => {
+            const n = esc(p.name) + (p.changed ? ' <span class="swapmark" title="Turno cambiato">↔</span>' : '');
+            return p.me ? `<b>${n} (tu)</b>` : n;
+          }).join(', ')}</div>
+        </div>`).join('');
+      const pres = sorted.filter(g => g.type.category !== 'assenza');
+      const ass = sorted.filter(g => g.type.category === 'assenza');
+      body.innerHTML =
+        (pres.length ? `<div class="section-label">In servizio</div>${renderGroups(pres)}` : '') +
+        (ass.length ? `<div class="section-label">Assenze e riposi</div>${renderGroups(ass)}` : '') +
+        `<div class="day-actions">
+          ${canRequest ? '<button class="btn primary block" id="askSwap">🔁 Cambia turno</button>' : ''}
+          ${isShiftAdmin() ? '<button class="btn block" id="adminSwap">Registra un cambio tra colleghi (admin)</button>' : ''}
+          ${isAdmin() ? '<button class="btn block" id="adminSet">Modifica il turno di una persona (admin)</button>' : ''}
+        </div>`;
+      const q = id => body.querySelector('#' + id);
+      if (q('askSwap')) q('askSwap').onclick = showPicker;
+      if (q('adminSwap')) q('adminSwap').onclick = showAdminSwap;
+      if (q('adminSet')) q('adminSet').onclick = showAdminSet;
+    };
+
+    // ---- scelta del collega ----
+    const showPicker = () => {
+      const others = people.filter(p => !p.me && p.type.id !== myRow.type.id);
+      const groups = groupsOf(others);
+      body.innerHTML = `
+        <button class="back" id="bk">‹ Indietro</button>
+        <h2>Con chi vuoi cambiare?</h2>
+        <p class="muted small">Il tuo turno: <b>${esc(myRow.type.name)}</b>. Scegli il collega: prenderai il suo turno e lui il tuo.</p>
+        ${groups.length ? groups.map(g => `
+          <div class="group">
+            ${groupHead(g.type)}
+            <div class="pick">${g.people.map(p => p.registered
+              ? `<button class="btn" data-pick="${esc(p.email)}">${esc(p.name)}</button>`
+              : `<button class="btn" disabled title="Non registrato">${esc(p.name)} <span class="small">(non registrato)</span></button>`).join('')}</div>
+          </div>`).join('') : '<p class="muted">Nessun collega con un turno diverso dal tuo in questo giorno.</p>'}`;
+      body.querySelector('#bk').onclick = showMain;
+      body.querySelectorAll('[data-pick]').forEach(b => b.onclick = () => showSend(people.find(p => p.email === b.dataset.pick)));
+    };
+
+    // ---- conferma e messaggio ----
+    const showSend = other => {
+      body.innerHTML = `
+        <button class="back" id="bk">‹ Indietro</button>
+        <h2>Richiesta di cambio</h2>
+        <div class="report">
+          <div><b>Tu</b>: ${esc(myRow.type.name)} → <b>${esc(other.type.name)}</b></div>
+          <div><b>${esc(other.name)}</b>: ${esc(other.type.name)} → <b>${esc(myRow.type.name)}</b></div>
+        </div>
+        <label for="msg">Messaggio (facoltativo)</label>
+        <textarea id="msg" rows="3" maxlength="500" placeholder="Es. Ciao, mi faresti questo cambio?"></textarea>
+        <button class="btn primary block" id="send">Invia richiesta</button>`;
+      body.querySelector('#bk').onclick = showPicker;
+      body.querySelector('#send').onclick = async e => {
+        e.target.disabled = true;
+        const { error } = await sb.rpc('create_swap_request', {
+          p_date: dayIso, p_target_email: other.email, p_message: body.querySelector('#msg').value,
+        });
+        if (error) { e.target.disabled = false; return toast(errMsg(error)); }
+        toast(`Richiesta inviata a ${other.name}`);
+        showMain();
+      };
+    };
+
+    const personOptions = () => groupsOf(people).flatMap(g => g.people)
+      .map(p => `<option value="${esc(p.email)}">${esc(p.name)} — ${esc(p.type.name)}</option>`).join('');
+
+    // ---- admin: scambio tra due persone ----
+    const showAdminSwap = () => {
+      body.innerHTML = `
+        <button class="back" id="bk">‹ Indietro</button>
+        <h2>Registra un cambio</h2>
+        <p class="muted small">Scambia i turni di due persone in questo giorno, anche se non sono registrate.</p>
+        <label>Prima persona</label><select id="pa">${personOptions()}</select>
+        <label>Seconda persona</label><select id="pb">${personOptions()}</select>
+        <button class="btn primary block" id="go">Scambia i turni</button>`;
+      body.querySelector('#bk').onclick = showMain;
+      body.querySelector('#pb').selectedIndex = Math.min(1, people.length - 1);
+      body.querySelector('#go').onclick = async e => {
+        const a = body.querySelector('#pa').value, b = body.querySelector('#pb').value;
+        if (a === b) return toast('Scegli due persone diverse');
+        e.target.disabled = true;
+        const { error } = await sb.rpc('admin_swap', { p_date: dayIso, p_a: a, p_b: b });
+        if (error) { e.target.disabled = false; return toast(errMsg(error)); }
+        toast('Cambio registrato');
+        dirty = true;
+        close();
+      };
+    };
+
+    // ---- admin completo: cambia direttamente un turno ----
+    const showAdminSet = async () => {
+      const { data: types } = await sb.from('shift_types').select('id, name, sort_order');
+      const opts = sortTypes(types || []).map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('');
+      body.innerHTML = `
+        <button class="back" id="bk">‹ Indietro</button>
+        <h2>Modifica un turno</h2>
+        <label>Persona</label><select id="pp">${personOptions()}</select>
+        <label>Nuovo turno</label><select id="tt">${opts}</select>
+        <button class="btn primary block" id="go">Salva</button>`;
+      body.querySelector('#bk').onclick = showMain;
+      const syncType = () => {
+        const p = people.find(x => x.email === body.querySelector('#pp').value);
+        if (p) body.querySelector('#tt').value = p.type.id;
+      };
+      body.querySelector('#pp').onchange = syncType;
+      syncType();
+      body.querySelector('#go').onclick = async e => {
+        e.target.disabled = true;
+        const { error } = await sb.rpc('admin_set_shift', {
+          p_date: dayIso, p_email: body.querySelector('#pp').value, p_type_id: Number(body.querySelector('#tt').value),
+        });
+        if (error) { e.target.disabled = false; return toast(errMsg(error)); }
+        toast('Turno modificato');
+        dirty = true;
+        close();
+      };
+    };
+
+    showMain();
+  }
+
+  // ------------------------------------------------------------------
+  // Richieste di cambio turno
+  // ------------------------------------------------------------------
+  const STATUS = {
+    pending: ['In attesa', ''],
+    accepted: ['Accettata', 'st-ok'],
+    rejected: ['Rifiutata', 'st-no'],
+    cancelled: ['Annullata', ''],
+    expired: ['Scaduta', ''],
+  };
+
+  async function renderRequests(view) {
+    view.innerHTML = `
+      <div class="topbar"><div class="title">Richieste di cambio</div></div>
+      <div class="content" id="reqList"><p class="muted">Caricamento…</p></div>`;
+    const box = document.getElementById('reqList');
+    const { data, error } = await sb.from('swap_requests')
+      .select(`*, req:people!swap_requests_requester_email_fkey(display_name), tgt:people!swap_requests_target_email_fkey(display_name),
+               rt:shift_types!swap_requests_requester_type_id_fkey(name), tt:shift_types!swap_requests_target_type_id_fkey(name)`)
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (error) { box.innerHTML = `<p class="err">${esc(errMsg(error))}</p>`; return; }
+    const me = state.session.user.id;
+    const incoming = data.filter(r => r.target_id === me && r.status === 'pending');
+    const outgoing = data.filter(r => r.requester_id === me && r.status === 'pending');
+    const history = data.filter(r => r.status !== 'pending');
+    const dname = r => longDate(fromIso(r.date));
+    const quote = (who, txt) => txt ? `<div class="quote"><span class="muted small">${esc(who)}:</span> ${esc(txt)}</div>` : '';
+
+    box.innerHTML = `
+      <h3>Da rispondere (${incoming.length})</h3>
+      <div class="list">${incoming.map(r => `
+        <div class="row" data-id="${r.id}">
+          <div><b>${esc(r.req?.display_name)}</b> ti chiede un cambio</div>
+          <div class="muted small" style="text-transform:capitalize">${dname(r)}</div>
+          <div class="report">
+            <div><b>Tu</b>: ${esc(r.tt?.name)} → <b>${esc(r.rt?.name)}</b></div>
+            <div><b>${esc(r.req?.display_name)}</b>: ${esc(r.rt?.name)} → <b>${esc(r.tt?.name)}</b></div>
+          </div>
+          ${quote(r.req?.display_name, r.message)}
+          <label>Risposta (facoltativa)</label>
+          <textarea class="resp" rows="2" maxlength="500"></textarea>
+          <div class="actions">
+            <button class="btn primary" data-ans="yes">Accetta</button>
+            <button class="btn danger" data-ans="no">Rifiuta</button>
+          </div>
+        </div>`).join('') || '<p class="muted">Nessuna richiesta da rispondere.</p>'}</div>
+
+      <h3>Inviate in attesa (${outgoing.length})</h3>
+      <div class="list">${outgoing.map(r => `
+        <div class="row" data-id="${r.id}">
+          <div>Hai chiesto a <b>${esc(r.tgt?.display_name)}</b></div>
+          <div class="muted small" style="text-transform:capitalize">${dname(r)}</div>
+          <div class="small" style="margin-top:6px">Tu: ${esc(r.rt?.name)} → <b>${esc(r.tt?.name)}</b></div>
+          ${quote('Tu', r.message)}
+          <div class="actions"><button class="btn" data-cancel>Annulla richiesta</button></div>
+        </div>`).join('') || '<p class="muted">Nessuna richiesta in attesa.</p>'}</div>
+
+      <h3>Storico</h3>
+      <div class="list">${history.map(r => {
+        const mine = r.requester_id === me;
+        const [label, cls] = STATUS[r.status] || [r.status, ''];
+        const isNew = mine && !r.requester_seen;
+        return `<div class="row">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+            <div>${mine ? `Tu → <b>${esc(r.tgt?.display_name)}</b>` : `<b>${esc(r.req?.display_name)}</b> → te`}</div>
+            <div>${isNew ? '<span class="pill st-new">Nuovo</span> ' : ''}<span class="pill ${cls}">${label}</span></div>
+          </div>
+          <div class="muted small" style="text-transform:capitalize">${dname(r)}</div>
+          <div class="small" style="margin-top:6px">${esc(r.rt?.name)} ↔ ${esc(r.tt?.name)}</div>
+          ${quote(mine ? 'Tu' : r.req?.display_name, r.message)}
+          ${quote(mine ? r.tgt?.display_name : 'Tu', r.response)}
+        </div>`;
+      }).join('') || '<p class="muted">Ancora nessun cambio.</p>'}</div>`;
+
+    box.querySelectorAll('[data-ans]').forEach(btn => btn.onclick = async () => {
+      const row = btn.closest('.row');
+      const accept = btn.dataset.ans === 'yes';
+      row.querySelectorAll('button').forEach(b => { b.disabled = true; });
+      const { data: res, error } = await sb.rpc('respond_swap', {
+        p_id: Number(row.dataset.id), p_accept: accept, p_response: row.querySelector('.resp').value,
+      });
+      if (error) { toast(errMsg(error)); }
+      else if (res === 'accepted') toast('Cambio accettato: il calendario è aggiornato');
+      else if (res === 'expired') toast('I turni sono cambiati nel frattempo: la richiesta è scaduta');
+      else toast('Richiesta rifiutata');
+      renderRequests(view);
+      refreshRequestsBadge();
     });
-    const sorted = sortTypes([...groups.values()], g => g.type);
+    box.querySelectorAll('[data-cancel]').forEach(btn => btn.onclick = async () => {
+      const row = btn.closest('.row');
+      btn.disabled = true;
+      const { error } = await sb.rpc('cancel_swap', { p_id: Number(row.dataset.id) });
+      toast(error ? errMsg(error) : 'Richiesta annullata');
+      renderRequests(view);
+    });
 
-    const renderGroups = list => list.map(g => `
-      <div class="group">
-        <div class="gname"><span class="dot" style="background:${esc(look(g.type).color)}"></span>${esc(g.type.name)}</div>
-        <div class="names">${g.people.sort((a, b) => a.name.localeCompare(b.name, 'it'))
-          .map(p => p.me ? `<b>${esc(p.name)} (tu)</b>` : esc(p.name)).join(', ')}</div>
-      </div>`).join('');
-
-    const pres = sorted.filter(g => g.type.category !== 'assenza');
-    const ass = sorted.filter(g => g.type.category === 'assenza');
-    body.innerHTML =
-      (pres.length ? `<div class="section-label">In servizio</div>${renderGroups(pres)}` : '') +
-      (ass.length ? `<div class="section-label">Assenze e riposi</div>${renderGroups(ass)}` : '');
+    // le risposte ricevute ora sono state viste
+    if (data.some(r => r.requester_id === me && !r.requester_seen)) {
+      await sb.rpc('mark_swaps_seen');
+    }
+    refreshRequestsBadge();
   }
 
   // ------------------------------------------------------------------
